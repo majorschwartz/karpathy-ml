@@ -1,0 +1,1 @@
+This is a repository for following along with Andrej Karpathy's [Zero to Hero](https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ "Zero to Hero YouTube Playlist") Course.
