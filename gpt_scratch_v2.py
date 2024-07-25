@@ -61,6 +61,9 @@ def estimate_loss():
 	model.train()
 	return out
 
+class Head(nn.Module):
+	pass
+
 # define model
 class BigramLanguageModel(nn.Module):
 	def __init__(self):
