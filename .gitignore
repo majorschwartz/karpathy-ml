@@ -1,2 +1,3 @@
-# hiding shakespeare.txt due to its size
-shakespeare.txt
+# hiding data and gen text files due to their size
+data-*.txt
+gen-*.txt

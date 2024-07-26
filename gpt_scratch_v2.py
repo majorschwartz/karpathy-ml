@@ -4,21 +4,28 @@ from torch.nn import functional as F
 import os
 
 # hyperparameters
-batch_size = 32
-block_size = 8
-max_iters = 3000
+batch_size = 64 # how many individual sequences to train on in parallel
+block_size = 128 # the number of tokens in the sequence
+max_iters = 5000
 eval_interval = max_iters // 10
-lr = 1e-2
-eval_iters = 200
-n_embd = 32
+lr = 3e-4
+eval_iters = 500
+n_embd = 384
+n_heads = 6
+n_layers = 6
+dropout = 0.25
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 torch.manual_seed(1337)
 
-if not os.path.exists("shakespeare.txt"):
-	os.system('curl https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt -o shakespeare.txt')
+data_names = ["shakespeare.txt", "harry-potter.txt"]
+data_endpoints = ["https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", ""]
+data_n = 1
 
-with open("shakespeare.txt", "r") as file:
+if not os.path.exists("data-" + data_names[data_n]):
+	os.system(f'curl {data_endpoints[data_n]} -o data-{data_names[data_n]}')
+
+with open(f"data-{data_names[data_n]}", "r") as file:
 	text = file.read()
 
 # all unique characters in text
@@ -62,7 +69,71 @@ def estimate_loss():
 	return out
 
 class Head(nn.Module):
-	pass
+	""" one head of self-attention """
+	def __init__(self, head_size):
+		super().__init__()
+		self.key = nn.Linear(n_embd, head_size, bias=False)
+		self.query = nn.Linear(n_embd, head_size, bias=False)
+		self.value = nn.Linear(n_embd, head_size, bias=False)
+		self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+		self.dropout = nn.Dropout(dropout)
+	
+	def forward(self, x):
+		B, T, C = x.shape
+		k = self.key(x) # (B, T, C)
+		q = self.query(x) # (B, T, C)
+		# compute scaled dot-product attention
+		wei = q @ k.transpose(-2, -1) + C**-0.5 # (B, T, C) @ (B, C, T) = (B, T, T)
+		wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+		wei = F.softmax(wei, dim=-1) # (B, T, T)
+		wei = self.dropout(wei)
+		# perform weighted aggregation of values
+		v = self.value(x) # (B, T, C)
+		out = wei @ v # (B, T, T) @ (B, T, C) = (B, T, C)
+		return out
+
+class MultiHeadAttention(nn.Module):
+	""" multiple heads of self-attention in parallel """
+	def __init__(self, num_heads, head_size):
+		super().__init__()
+		self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+		self.proj = nn.Linear(n_embd, n_embd)
+		self.dropout = nn.Dropout(dropout)
+		
+	def forward(self, x):
+		out = torch.cat([h(x) for h in self.heads], dim=-1)
+		out = self.proj(out)
+		out = self.dropout(out)
+		return out
+
+class FeedForward(nn.Module):
+	""" a simple linear layer follewed by a non-linearity """
+	def __init__(self, n_embd):
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.Linear(n_embd, 4 * n_embd),
+			nn.ReLU(),
+			nn.Linear(4 * n_embd, n_embd),
+			nn.Dropout(dropout)
+		)
+	
+	def forward(self, x):
+		return self.net(x)
+
+class Block(nn.Module):
+	""" Transformer block: communication followed by computation """
+	def __init__(self, n_embd, n_heads):
+		super().__init__()
+		head_size = n_embd // n_heads
+		self.sa_heads = MultiHeadAttention(n_heads, head_size)
+		self.ffwd = FeedForward(n_embd)
+		self.ln1 = nn.LayerNorm(n_embd)
+		self.ln2 = nn.LayerNorm(n_embd)
+	
+	def forward(self, x):
+		x = x + self.sa_heads(self.ln1(x))
+		x = x + self.ffwd(self.ln2(x))
+		return x
 
 # define model
 class BigramLanguageModel(nn.Module):
@@ -70,15 +141,20 @@ class BigramLanguageModel(nn.Module):
 		super().__init__()
 		self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
 		self.position_embedding_table = nn.Embedding(block_size, n_embd)
+		self.blocks = nn.Sequential(*[Block(n_embd, n_heads) for _ in range(n_layers)])
+		self.ln_f = nn.LayerNorm(n_embd) # final layer norm
 		self.lm_head = nn.Linear(n_embd, vocab_size)
 
 	def forward(self, idx, targets=None):
 		B, T = idx.shape
-		# idx and targets are both of shape [batch_size, block_size]
-		token_emb = self.token_embedding_table(idx) # shape [batch_size, block_size, n_embd]
-		pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # shape [block_size, n_embd]
-		x = token_emb + pos_emb # shape [batch_size, block_size, n_embd]
-		logits = self.lm_head(x) # shape [batch_size, block_size, vocab_size]
+		
+		# idx and targets are both of shape (B, T)
+		token_emb = self.token_embedding_table(idx) # (B, T, C)
+		pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
+		x = token_emb + pos_emb # (B, T, C)
+		x = self.blocks(x) # (B, T, C)
+		x = self.ln_f(x) # (B, T, C)
+		logits = self.lm_head(x) # (B, T, vocab_size)
 		
 		# if we don't have targets, skip loss calculation
 		if targets is None:
@@ -95,8 +171,10 @@ class BigramLanguageModel(nn.Module):
 		# idx is of shape [batch_size, block_size], array of indices in the current context
 		# max_new_tokens is the maximum number of new tokens to generate
 		for _ in range(max_new_tokens):
+			# crop idx to last block_size tokens
+			idx_cond = idx[:, -block_size:]
 			# get predictions for the next token
-			logits, _ = self(idx) # loss is not needed for generation (hence _)
+			logits, _ = self(idx_cond) # loss is not needed for generation (hence _)
 			# only look at the last time step
 			logits = logits[:, -1, :] # becomes shape [batch_size, vocab_size]
 			# use softmax to get probabilities
@@ -116,7 +194,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 for iter in range(max_iters):
 	
 	# evaluate loss every eval_interval iterations
-	if iter % eval_interval == 0:
+	if iter % eval_interval == 0 or iter == max_iters - 1:
 		losses = estimate_loss()
 		print(f'Step {iter} | Train loss: {losses["train"]:.4f} | Val loss: {losses["val"]:.4f}')
 	
@@ -131,5 +209,9 @@ for iter in range(max_iters):
 
 # generate some text
 idx = torch.zeros((1, 1), dtype=torch.int64, device=device)
-generation = m.generate(idx, max_new_tokens=300)[0]
-print(decode(generation.tolist()))
+generation = m.generate(idx, max_new_tokens=5000)[0]
+print(decode(generation.tolist())[:300])
+
+# make file and save generation to it
+with open(f"gen-{data_names[data_n]}", "w") as file:
+	file.write(decode(generation.tolist()))
